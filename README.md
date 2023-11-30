@@ -9,10 +9,9 @@ often only work for XMODEM-1K.
 
 Here are the referenced codebases and documents:
 
-(https://github.com/tarm/serial/blob/master/serial_linux.go)
-(https://github.com/kelvinlawson/xmodem-1k/blob/master/xmodem.c#L133)
-(https://www.adontec.com/xmodem-protocol.htm)
-(https://www.ninerpedia.org/wiki/Protocols)
-(https://en.wikipedia.org/wiki/XMODEM#XMODEM-1K)
-(https://github.com/ethanholz/go-xmodem)
-
+- [tarm](https://github.com/tarm/serial/blob/master/serial_linux.go)
+- [c implementation](https://github.com/kelvinlawson/xmodem-1k/blob/master/xmodem.c#L133)
+- [protocol writeup](https://www.adontec.com/xmodem-protocol.htm)
+- [nindepedia](https://www.ninerpedia.org/wiki/Protocols)
+- [wikipedia](https://en.wikipedia.org/wiki/XMODEM#XMODEM-1K)
+- [testing fork](https://github.com/taigrr/go-xmodem)
