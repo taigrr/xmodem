@@ -83,7 +83,7 @@ func (x Xmodem) Send(payload bytes.Buffer) error {
 		bytePacket = make([]byte, 1)
 		totalSent  = 0
 	)
-
+	x.port.Flush()
 protocolSniff:
 	for {
 		// Listen for first NAK or CRC
@@ -169,9 +169,11 @@ protocolSniff:
 			if totalSent%100 == 0 {
 				log.Printf("send: block %d\n", totalSent)
 			}
-			_, err := x.port.Write(header)
+			packet := append(header, data...)
+			packet = append(packet, checkSum...)
+			_, err := x.port.Write(packet)
 			if err != nil {
-				log.Errorf("Error writing header: %v", err)
+				log.Errorf("Error writing packet: %v", err)
 				errorCount++
 				if errorCount > x.retries {
 					log.Errorf("send error: error_count reached %d, aborting.\n", x.retries)
@@ -179,26 +181,7 @@ protocolSniff:
 				}
 				continue
 			}
-			_, err = x.port.Write(data)
-			if err != nil {
-				log.Errorf("Error writing data: %v", err)
-				errorCount++
-				if errorCount > x.retries {
-					log.Errorf("send error: error_count reached %d, aborting.\n", x.retries)
-					return ErrTransferCanceled
-				}
-				continue
-			}
-			_, err = x.port.Write(checkSum)
-			if err != nil {
-				log.Errorf("Error writing checksum: %v", err)
-				errorCount++
-				if errorCount > x.retries {
-					log.Errorf("send error: error_count reached %d, aborting.\n", x.retries)
-					return ErrTransferCanceled
-				}
-				continue
-			}
+
 			// Listen for first NAK or CRC
 			_, err = x.port.Read(bytePacket)
 			if err != nil {
