@@ -7,6 +7,10 @@ func TestCRCString(t *testing.T) {
 	if crc != 0x4ab3 {
 		t.Errorf("CRCString(\"helloworld\") = %x, want 0x4ab3", crc)
 	}
+	crc = CRCString("123456789", 0)
+	if crc != 0x31c3 {
+		t.Errorf("CRCString(\"123456789\") = %x, want 0x31c3", crc)
+	}
 }
 
 func TestCRC(t *testing.T) {
