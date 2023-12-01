@@ -19,6 +19,7 @@ const (
 	DLE = 0x10
 	NAK = 0x15
 	CAN = 0x18
+	SUB = 0x1A
 	CRC = 'C'
 
 	XMode128 Mode = iota
@@ -43,11 +44,44 @@ func (x Xmodem) Abort() {
 	x.port.Write([]byte{CAN, CAN})
 }
 
+func NewWithPort(port *serial.Port) *Xmodem {
+	return &Xmodem{
+		port:    port,
+		Padding: SUB,
+		Mode:    XModeCRC,
+		retries: 10,
+		Timeout: time.Second * 5,
+	}
+}
+
+func New(port string, baud int) (*Xmodem, error) {
+	portConfig := &serial.Config{
+		Name:        port,
+		Baud:        baud,
+		ReadTimeout: time.Duration(5) * time.Second,
+		Size:        serial.DefaultSize,
+		Parity:      serial.ParityNone,
+		StopBits:    serial.Stop1,
+	}
+	p, err := serial.OpenPort(portConfig)
+	if err != nil {
+		return nil, err
+	}
+	return &Xmodem{
+		port:    p,
+		Padding: SUB,
+		Mode:    XModeCRC,
+		retries: 10,
+		Timeout: time.Second * 5,
+	}, nil
+}
+
 func (x Xmodem) Send(payload bytes.Buffer) error {
 	var (
 		errorCount = 0
 		cancel     = 0
 		bytePacket = make([]byte, 1)
+		totalSent  = 0
 	)
 
 protocolSniff:
@@ -63,8 +97,7 @@ protocolSniff:
 			}
 			continue
 		}
-		startByte := bytePacket[0]
-		switch startByte {
+		switch bytePacket[0] {
 		case NAK:
 			log.Tracef("standard checksum requested (NAK).\n")
 			x.Mode = XMode128
@@ -83,7 +116,7 @@ protocolSniff:
 			log.Errorf("Transmission canceled: received EOT at start-sequence\n")
 			return ErrTransferCanceled
 		default:
-			log.Debugf("Expected NAK, CRC, CAN, or EOT, got %v", startByte)
+			log.Debugf("Expected NAK, CRC, CAN, or EOT, got %v", bytePacket[0])
 			errorCount++
 			if errorCount > x.retries {
 				log.Errorf("send error: error_count reached %d, aborting.\n", x.retries)
@@ -103,7 +136,7 @@ protocolSniff:
 		data := make([]byte, packetSize)
 		n, err := payload.Read(data)
 		if err != nil || n == 0 {
-			log.Printf("send: at EOF\n")
+			log.Printf("send: at EOF")
 			break
 		} else if n < packetSize {
 			log.Tracef("send: short read, padding with %d bytes\n", packetSize-n)
@@ -119,10 +152,9 @@ protocolSniff:
 		}
 		header[1] = byte(sequence)
 		header[2] = byte(255 - sequence)
-		data = append(data[:n], make([]byte, packetSize-n)...)
-		// TODO: Implement CRC8
 		var checkSum []byte
 		if x.Mode == XMode128 {
+			// TODO: Implement CRC8
 			return errors.New("128 mode checksum not implemented")
 		} else {
 			cs := crc16.CRC(data, 0)
@@ -132,7 +164,9 @@ protocolSniff:
 		}
 	sendLoop:
 		for {
-			log.Printf("send: block %d\n", sequence)
+			if totalSent%100 == 0 {
+				log.Printf("send: block %d\n", totalSent)
+			}
 			_, err := x.port.Write(header)
 			if err != nil {
 				log.Errorf("Error writing header: %v", err)
@@ -178,9 +212,10 @@ protocolSniff:
 			case ACK:
 				errorCount = 0
 				sequence = (sequence + 1) % 256
+				totalSent++
 				break sendLoop
 			case NAK:
-				log.Errorf("send error: NAK received for block %d", sequence)
+				log.Errorf("send error: NAK received for block %d", totalSent)
 				errorCount++
 				if errorCount > x.retries {
 					log.Error("Too many errors, aborting transfer", errorCount)
@@ -196,6 +231,7 @@ protocolSniff:
 			}
 		}
 	}
+	log.Printf("sent final: block %d\n", totalSent)
 	for {
 		log.Info("sending EOT, awaiting ACK")
 		// End of transmission
@@ -209,9 +245,10 @@ protocolSniff:
 			}
 			continue
 		}
+		log.Info("EOT sent")
 		// An ACK should be returned
-		_, err = x.port.Read(bytePacket)
-		if err != nil {
+		n, err := x.port.Read(bytePacket)
+		if err != nil || n == 0 {
 			log.Errorf("Error reading from port: %v", err)
 			errorCount++
 			if errorCount > x.retries {
@@ -219,6 +256,8 @@ protocolSniff:
 				return err
 			}
 			continue
+		} else {
+			log.Tracef("Received `%v`", bytePacket[0])
 		}
 		switch bytePacket[0] {
 		case ACK:
