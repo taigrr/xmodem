@@ -14,6 +14,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	modem.Mode = xmodem.XMode1K
 	f, err := os.ReadFile(os.Args[2])
 	if err != nil {
 		panic(err)

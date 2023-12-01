@@ -104,7 +104,9 @@ protocolSniff:
 			break protocolSniff
 		case CRC:
 			log.Tracef("16-bit CRC requested (CRC).\n")
-			x.Mode = XModeCRC
+			if x.Mode == XMode128 {
+				x.Mode = XModeCRC
+			}
 			break protocolSniff
 		case CAN:
 			if cancel != 0 {
