@@ -3,6 +3,7 @@ package xmodem
 import (
 	"bytes"
 	"errors"
+	"io"
 	"time"
 
 	"github.com/taigrr/log-socket/log"
@@ -21,16 +22,26 @@ const (
 	CAN = 0x18
 	SUB = 0x1A
 	CRC = 'C'
+)
 
+const (
 	XMode128 Mode = iota
 	XModeCRC
 	XMode1K
 )
 
 type (
-	Mode   int
+	Mode int
+
+	// Port abstracts a serial port for reading, writing, and flushing.
+	// *serial.Port satisfies this interface.
+	Port interface {
+		io.ReadWriter
+		Flush() error
+	}
+
 	Xmodem struct {
-		port    *serial.Port
+		port    Port
 		Padding byte
 		Mode    Mode
 		retries int
@@ -44,7 +55,18 @@ func (x Xmodem) Abort() {
 	x.port.Write([]byte{CAN, CAN})
 }
 
+// NewWithPort creates an Xmodem instance from an existing serial port.
 func NewWithPort(port *serial.Port) *Xmodem {
+	return newWithPort(port)
+}
+
+// NewWithReadWriter creates an Xmodem instance from any Port implementation.
+// This is useful for testing or non-serial transports.
+func NewWithReadWriter(port Port) *Xmodem {
+	return newWithPort(port)
+}
+
+func newWithPort(port Port) *Xmodem {
 	return &Xmodem{
 		port:    port,
 		Padding: SUB,
@@ -74,6 +96,15 @@ func New(port string, baud int) (*Xmodem, error) {
 		retries: 10,
 		Timeout: time.Second * 5,
 	}, nil
+}
+
+// checksum8 computes a simple 8-bit checksum (sum of all bytes mod 256).
+func checksum8(data []byte) byte {
+	var sum byte
+	for _, b := range data {
+		sum += b
+	}
+	return sum
 }
 
 func (x Xmodem) Send(payload bytes.Buffer) error {
@@ -156,8 +187,8 @@ protocolSniff:
 		header[2] = byte(255 - sequence)
 		var checkSum []byte
 		if x.Mode == XMode128 {
-			// TODO: Implement CRC8
-			return errors.New("128 mode checksum not implemented")
+			cs := checksum8(data)
+			checkSum = []byte{cs}
 		} else {
 			cs := crc16.CRC(data, 0)
 			checkSum = make([]byte, 2)
@@ -182,7 +213,7 @@ protocolSniff:
 				continue
 			}
 
-			// Listen for first NAK or CRC
+			// Listen for ACK or NAK
 			_, err = x.port.Read(bytePacket)
 			if err != nil {
 				log.Errorf("Error reading from port: %v", err)

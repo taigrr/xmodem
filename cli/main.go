@@ -21,7 +21,9 @@ func main() {
 	}
 	b := bytes.NewBuffer(f)
 	log.Infof("Sending file: %s", os.Args[2])
-	modem.Send(*b)
+	if err := modem.Send(*b); err != nil {
+		log.Fatalf("Send failed: %v", err)
+	}
 	log.Info("File sent")
 
 	log.Flush()
