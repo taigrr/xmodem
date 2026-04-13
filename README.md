@@ -5,9 +5,11 @@ This library was created to address limitations in existing Go XMODEM implementa
 
 ## Features
 
-- Supports XMODEM-CRC and XMODEM-1K protocols
+- **Send and Receive** — full bidirectional XMODEM transfers
+- Supports XMODEM-128 (checksum), XMODEM-CRC, and XMODEM-1K protocols
 - Configurable retries and timeouts
 - Automatic protocol detection
+- `Port` interface for testing and non-serial transports
 - Simple API for file transfers
 
 ## Usage
@@ -43,28 +45,48 @@ func main() {
 }
 ```
 
-### Advanced Configuration
+### Receiving a File
 
 ```go
-// Create with existing serial port
-port, _ := serial.OpenPort(&serial.Config{
-    Name: "/dev/ttyUSB0",
-    Baud: 115200,
-})
-x := xmodem.NewWithPort(port)
+package main
 
-// Configure settings
-x.Mode = xmodem.XMode1K  // Use XMODEM-1K
-x.Padding = 0x1A         // Set padding character
-x.retries = 5            // Set retry count
-x.Timeout = time.Second * 10  // Set timeout
+import (
+    "os"
+    "github.com/taigrr/xmodem"
+)
+
+func main() {
+    x, err := xmodem.New("/dev/ttyUSB0", 115200)
+    if err != nil {
+        panic(err)
+    }
+
+    f, err := os.Create("received.bin")
+    if err != nil {
+        panic(err)
+    }
+    defer f.Close()
+
+    // Receive initiates the handshake and writes blocks to the writer
+    if err := x.Receive(f); err != nil {
+        panic(err)
+    }
+}
+```
+
+### Using the Port Interface (Testing / Non-Serial)
+
+```go
+// Any type implementing io.ReadWriter + Flush() works
+x := xmodem.NewWithReadWriter(myPort)
+x.Mode = xmodem.XMode1K
 ```
 
 ## Protocol Support
 
-- XMODEM-CRC (default)
-- XMODEM-1K
-- XMODEM-128 (checksum mode not implemented)
+- **XMODEM-CRC** (default) — 128-byte blocks with 16-bit CRC
+- **XMODEM-1K** — 1024-byte blocks with 16-bit CRC
+- **XMODEM-128** — 128-byte blocks with 8-bit checksum
 
 ## References
 
