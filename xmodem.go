@@ -319,6 +319,9 @@ func (x Xmodem) readFull(buf []byte) error {
 		if err != nil {
 			return err
 		}
+		if n == 0 {
+			return io.ErrNoProgress
+		}
 		offset += n
 	}
 	return nil
