@@ -44,6 +44,20 @@ func (mp *mockPort) Flush() error {
 	return nil
 }
 
+type zeroProgressPort struct{}
+
+func (zeroProgressPort) Read(_ []byte) (int, error) {
+	return 0, nil
+}
+
+func (zeroProgressPort) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (zeroProgressPort) Flush() error {
+	return nil
+}
+
 func TestConstants(t *testing.T) {
 	tests := []struct {
 		name string
@@ -128,6 +142,15 @@ func TestAbort(t *testing.T) {
 	written := mock.writeBuf.Bytes()
 	if len(written) != 2 || written[0] != CAN || written[1] != CAN {
 		t.Errorf("Abort wrote %v, want [CAN CAN]", written)
+	}
+}
+
+func TestReadFullReturnsNoProgress(t *testing.T) {
+	xm := NewWithReadWriter(zeroProgressPort{})
+
+	err := xm.readFull(make([]byte, 1))
+	if !errors.Is(err, io.ErrNoProgress) {
+		t.Fatalf("expected io.ErrNoProgress, got %v", err)
 	}
 }
 
