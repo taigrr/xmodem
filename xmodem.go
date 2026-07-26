@@ -132,14 +132,13 @@ func (x Xmodem) Send(payload bytes.Buffer) error {
 	var (
 		errorCount = 0
 		cancel     = 0
-		bytePacket = make([]byte, 1)
 		totalSent  = 0
 	)
 	x.port.Flush()
 protocolSniff:
 	for {
 		// Listen for first NAK or CRC
-		_, err := x.port.Read(bytePacket)
+		controlByte, err := x.readByte()
 		if err != nil {
 			log.Errorf("Error reading from port: %v", err)
 			errorCount++
@@ -149,7 +148,7 @@ protocolSniff:
 			}
 			continue
 		}
-		switch bytePacket[0] {
+		switch controlByte {
 		case NAK:
 			log.Tracef("standard checksum requested (NAK).\n")
 			x.Mode = XMode128
@@ -170,7 +169,7 @@ protocolSniff:
 			log.Errorf("Transmission canceled: received EOT at start-sequence\n")
 			return ErrTransferCanceled
 		default:
-			log.Debugf("Expected NAK, CRC, CAN, or EOT, got %v", bytePacket[0])
+			log.Debugf("Expected NAK, CRC, CAN, or EOT, got %v", controlByte)
 			errorCount++
 			if errorCount > x.retries {
 				log.Errorf("send error: error_count reached %d, aborting.\n", x.retries)
@@ -235,7 +234,7 @@ protocolSniff:
 			}
 
 			// Listen for ACK or NAK
-			_, err = x.port.Read(bytePacket)
+			controlByte, err := x.readByte()
 			if err != nil {
 				log.Errorf("Error reading from port: %v", err)
 				errorCount++
@@ -245,7 +244,7 @@ protocolSniff:
 				}
 				continue
 			}
-			switch bytePacket[0] {
+			switch controlByte {
 			case ACK:
 				errorCount = 0
 				sequence = (sequence + 1) % 256
@@ -259,7 +258,7 @@ protocolSniff:
 					return ErrTransferCanceled
 				}
 			default:
-				log.Errorf("send error: expected ACK or NAK, got %v", bytePacket[0])
+				log.Errorf("send error: expected ACK or NAK, got %v", controlByte)
 				errorCount++
 				if errorCount > x.retries {
 					log.Error("Too many errors, aborting transfer", errorCount)
@@ -284,8 +283,8 @@ protocolSniff:
 		}
 		log.Info("EOT sent")
 		// An ACK should be returned
-		n, err := x.port.Read(bytePacket)
-		if err != nil || n == 0 {
+		controlByte, err := x.readByte()
+		if err != nil {
 			log.Errorf("Error reading from port: %v", err)
 			errorCount++
 			if errorCount > x.retries {
@@ -294,14 +293,14 @@ protocolSniff:
 			}
 			continue
 		} else {
-			log.Tracef("Received `%v`", bytePacket[0])
+			log.Tracef("Received `%v`", controlByte)
 		}
-		switch bytePacket[0] {
+		switch controlByte {
 		case ACK:
 			log.Info("ACK received, transmission successful")
 			return nil
 		default:
-			log.Errorf("send error: expected ACK; got %v\n", bytePacket[0])
+			log.Errorf("send error: expected ACK; got %v\n", controlByte)
 			errorCount++
 			if errorCount > x.retries {
 				log.Errorf("EOT was not ACKd, aborting transfer")
@@ -309,6 +308,18 @@ protocolSniff:
 			}
 		}
 	}
+}
+
+func (x Xmodem) readByte() (byte, error) {
+	buf := make([]byte, 1)
+	n, err := x.port.Read(buf)
+	if err != nil {
+		return 0, err
+	}
+	if n == 0 {
+		return 0, io.ErrNoProgress
+	}
+	return buf[0], nil
 }
 
 // readFull reads exactly len(buf) bytes from the port, retrying partial reads.
@@ -435,20 +446,22 @@ func (x Xmodem) Receive(w io.Writer) error {
 			continue
 		}
 
-		if _, err := x.port.Read(bytePacket); err != nil {
+		controlByte, err := x.readByte()
+		if err != nil {
 			log.Errorf("Timeout waiting for sender: %v", err)
 			errorCount++
 			continue
 		}
 
-		switch bytePacket[0] {
+		switch controlByte {
 		case SOH, STX, EOT:
+			bytePacket[0] = controlByte
 			handshakeDone = true
 		case CAN:
 			log.Errorf("Sender canceled transfer")
 			return ErrTransferCanceled
 		default:
-			log.Debugf("Unexpected byte during handshake: 0x%02x", bytePacket[0])
+			log.Debugf("Unexpected byte during handshake: 0x%02x", controlByte)
 			errorCount++
 		}
 	}
@@ -471,7 +484,7 @@ func (x Xmodem) Receive(w io.Writer) error {
 
 		// Handle CAN
 		if header == CAN {
-			if _, err := x.port.Read(bytePacket); err == nil && bytePacket[0] == CAN {
+			if controlByte, err := x.readByte(); err == nil && controlByte == CAN {
 				log.Errorf("receive: double CAN, transfer canceled")
 				return ErrTransferCanceled
 			}
@@ -516,13 +529,16 @@ func (x Xmodem) Receive(w io.Writer) error {
 		}
 
 		// Read next header byte
-		if _, err := x.port.Read(bytePacket); err != nil {
+		controlByte, err := x.readByte()
+		if err != nil {
 			log.Errorf("Error reading next header: %v", err)
 			errorCount++
 			if errorCount > x.retries {
 				x.Abort()
 				return err
 			}
+			continue
 		}
+		bytePacket[0] = controlByte
 	}
 }

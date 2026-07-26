@@ -58,6 +58,28 @@ func (zeroProgressPort) Flush() error {
 	return nil
 }
 
+type firstByteThenNoProgressPort struct {
+	first byte
+	read  bool
+}
+
+func (p *firstByteThenNoProgressPort) Read(buf []byte) (int, error) {
+	if !p.read {
+		p.read = true
+		buf[0] = p.first
+		return 1, nil
+	}
+	return 0, nil
+}
+
+func (p *firstByteThenNoProgressPort) Write(buf []byte) (int, error) {
+	return len(buf), nil
+}
+
+func (p *firstByteThenNoProgressPort) Flush() error {
+	return nil
+}
+
 func TestConstants(t *testing.T) {
 	tests := []struct {
 		name string
@@ -149,6 +171,25 @@ func TestReadFullReturnsNoProgress(t *testing.T) {
 	xm := NewWithReadWriter(zeroProgressPort{})
 
 	err := xm.readFull(make([]byte, 1))
+	if !errors.Is(err, io.ErrNoProgress) {
+		t.Fatalf("expected io.ErrNoProgress, got %v", err)
+	}
+}
+
+func TestReadByteReturnsNoProgress(t *testing.T) {
+	xm := NewWithReadWriter(zeroProgressPort{})
+
+	_, err := xm.readByte()
+	if !errors.Is(err, io.ErrNoProgress) {
+		t.Fatalf("expected io.ErrNoProgress, got %v", err)
+	}
+}
+
+func TestSendReturnsNoProgressAwaitingEOTACK(t *testing.T) {
+	xm := NewWithReadWriter(&firstByteThenNoProgressPort{first: CRC})
+	xm.retries = 1
+
+	err := xm.Send(*bytes.NewBuffer(nil))
 	if !errors.Is(err, io.ErrNoProgress) {
 		t.Fatalf("expected io.ErrNoProgress, got %v", err)
 	}
