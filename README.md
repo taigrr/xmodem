@@ -1,5 +1,9 @@
 # XMODEM
 
+[![Test](https://github.com/taigrr/xmodem/actions/workflows/test.yml/badge.svg)](https://github.com/taigrr/xmodem/actions/workflows/test.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/taigrr/xmodem.svg)](https://pkg.go.dev/github.com/taigrr/xmodem)
+[![Go Report Card](https://goreportcard.com/badge/github.com/taigrr/xmodem)](https://goreportcard.com/report/github.com/taigrr/xmodem)
+
 A robust XMODEM implementation in Go that supports XMODEM-CRC and XMODEM-1K protocols.
 This library was created to address limitations in existing Go XMODEM implementations, particularly around XMODEM-CRC support.
 
@@ -31,7 +35,6 @@ func main() {
     if err != nil {
         panic(err)
     }
-    defer x.port.Close()
 
     // Prepare your data
     data := []byte("Hello, XMODEM!")
@@ -96,6 +99,10 @@ x.Mode = xmodem.XMode1K
 - [nindepedia](https://www.ninerpedia.org/wiki/Protocols)
 - [wikipedia](https://en.wikipedia.org/wiki/XMODEM#XMODEM-1K)
 - [testing fork](https://github.com/taigrr/go-xmodem)
+
+## License
+
+Released under the [0BSD](LICENSE) license.
 
 ## Disclaimer
 
