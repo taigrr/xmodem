@@ -508,6 +508,7 @@ func (x Xmodem) Receive(w io.Writer) error {
 	}
 
 	// Main receive loop
+	eotSeen := false
 mainLoop:
 	for {
 		header := bytePacket[0]
@@ -520,7 +521,9 @@ mainLoop:
 			// transmit a single EOT: if the sender does not resend EOT the
 			// confirmation read times out and the transfer still completes,
 			// never failing an otherwise fully-received transfer. If real data
-			// (SOH/STX) arrives instead, the EOT was spurious and we resume.
+			// (SOH/STX) arrives instead, it is either a resent last block
+			// (transfer already complete) or a fresh block (the EOT was
+			// spurious and we resume); eotSeen distinguishes the two below.
 			log.Debugf("receive: EOT received, sending NAK to confirm")
 			x.port.Write([]byte{NAK})
 			for attempt := 0; attempt <= x.retries; attempt++ {
@@ -533,7 +536,8 @@ mainLoop:
 					break
 				}
 				if controlByte == SOH || controlByte == STX {
-					log.Debugf("receive: data after EOT, resuming transfer")
+					log.Debugf("receive: data after EOT, evaluating block")
+					eotSeen = true
 					bytePacket[0] = controlByte
 					continue mainLoop
 				}
@@ -572,10 +576,19 @@ mainLoop:
 				}
 				x.port.Write([]byte{NAK})
 			} else if isDuplicate {
+				if eotSeen {
+					// The sender resent the last block in response to our
+					// EOT-NAK: the transfer is already fully received. ACK the
+					// block and complete rather than failing it.
+					log.Info("receive: duplicate after EOT, transfer complete")
+					x.port.Write([]byte{ACK})
+					log.Printf("receive: transfer complete, %d blocks received", totalReceived)
+					return nil
+				}
 				// ACK the duplicate (the sender missed our previous ACK), but
 				// count it against the retry ceiling so a sender stuck resending
-				// an already-received block — or ping-ponging block/EOT after our
-				// EOT-NAK — cannot loop forever. A fresh block resets the count.
+				// an already-received block cannot loop forever. A fresh block
+				// resets the count.
 				errorCount++
 				if errorCount > x.retries {
 					x.Abort()
@@ -589,6 +602,7 @@ mainLoop:
 					return err
 				}
 				errorCount = 0
+				eotSeen = false
 				expectedSeq = byte((int(expectedSeq) + 1) % 256)
 				totalReceived++
 				log.Tracef("receive: block %d ACK'd", totalReceived)

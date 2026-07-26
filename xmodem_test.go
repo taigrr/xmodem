@@ -1261,3 +1261,26 @@ func TestReceiveDuplicateLivelockBounded(t *testing.T) {
 		t.Fatal("Receive did not terminate: duplicate livelock is unbounded")
 	}
 }
+
+func TestReceiveBlockResendAfterEOTCompletes(t *testing.T) {
+	// A sender that responds to our EOT-NAK by resending the last data block
+	// (instead of resending EOT) must still complete successfully — the data
+	// was already fully received.
+	mock := newMockPort()
+	xm := NewWithReadWriter(mock)
+	xm.Mode = XModeCRC
+
+	data := bytes.Repeat([]byte{0x7E}, 128)
+	block := buildBlock(SOH, 1, data, true)
+	mock.readBuf.Write(block)
+	mock.readBuf.WriteByte(EOT) // first EOT -> we NAK
+	mock.readBuf.Write(block)   // sender resends last block instead of EOT
+
+	var out bytes.Buffer
+	if err := xm.Receive(&out); err != nil {
+		t.Fatalf("Receive returned error for block-resend-after-EOT sender: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Errorf("received data mismatch")
+	}
+}
