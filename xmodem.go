@@ -505,6 +505,7 @@ func (x Xmodem) Receive(w io.Writer) error {
 				}
 				x.port.Write([]byte{NAK})
 			} else if isDuplicate {
+				errorCount = 0
 				x.port.Write([]byte{ACK})
 			} else {
 				if _, err := w.Write(data); err != nil {
