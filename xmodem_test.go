@@ -80,6 +80,39 @@ func (p *firstByteThenNoProgressPort) Flush() error {
 	return nil
 }
 
+// zeroThenBufPort serves bytes from pre, then returns a single zero-progress
+// read (0, nil), then serves bytes from post. It counts NAK bytes written.
+type zeroThenBufPort struct {
+	pre      *bytes.Buffer
+	post     *bytes.Buffer
+	zeroDone bool
+	naks     int
+}
+
+func (p *zeroThenBufPort) Read(buf []byte) (int, error) {
+	if p.pre.Len() > 0 {
+		return p.pre.Read(buf)
+	}
+	if !p.zeroDone {
+		p.zeroDone = true
+		return 0, nil
+	}
+	return p.post.Read(buf)
+}
+
+func (p *zeroThenBufPort) Write(buf []byte) (int, error) {
+	for _, b := range buf {
+		if b == NAK {
+			p.naks++
+		}
+	}
+	return len(buf), nil
+}
+
+func (p *zeroThenBufPort) Flush() error {
+	return nil
+}
+
 func TestConstants(t *testing.T) {
 	tests := []struct {
 		name string
@@ -494,6 +527,33 @@ func buildBlock(header byte, seq byte, data []byte, useCRC bool) []byte {
 		block = append(block, sum)
 	}
 	return block
+}
+
+func TestReceiveRetriesTransientHeaderRead(t *testing.T) {
+	data := bytes.Repeat([]byte{0xAA}, 128)
+	block := buildBlock(SOH, 1, data, true)
+
+	// pre serves the first block; then a one-shot zero-progress read simulates
+	// a transient timeout while awaiting the next header; post then delivers EOT.
+	port := &zeroThenBufPort{
+		pre:  bytes.NewBuffer(block),
+		post: bytes.NewBuffer([]byte{EOT}),
+	}
+	xm := NewWithReadWriter(port)
+	xm.Mode = XModeCRC
+
+	var out bytes.Buffer
+	if err := xm.Receive(&out); err != nil {
+		t.Fatalf("Receive returned error: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Fatalf("received %d bytes, want %d", out.Len(), len(data))
+	}
+	// The transient read must have triggered exactly one retry NAK (in addition
+	// to the initial handshake byte), not a reprocessed stale header.
+	if port.naks != 1 {
+		t.Fatalf("expected 1 NAK from the transient read retry, got %d", port.naks)
+	}
 }
 
 func TestReceiveCRCMode(t *testing.T) {

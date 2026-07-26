@@ -528,20 +528,22 @@ func (x Xmodem) Receive(w io.Writer) error {
 			x.port.Write([]byte{NAK})
 		}
 
-		// Read next header byte
-		controlByte, err := x.readByte()
-		if err != nil {
-			log.Errorf("Error reading next header: %v", err)
-			errorCount++
-			if errorCount > x.retries {
-				x.Abort()
-				return err
+		// Read next header byte, retrying on transient read failures so a
+		// failed read never re-drives the state machine with a stale header.
+		for {
+			controlByte, err := x.readByte()
+			if err != nil {
+				log.Errorf("Error reading next header: %v", err)
+				errorCount++
+				if errorCount > x.retries {
+					x.Abort()
+					return err
+				}
+				x.port.Write([]byte{NAK})
+				continue
 			}
-			// Invalidate the header so a failed read never re-drives the
-			// state machine with the previous (stale) header byte.
-			bytePacket[0] = 0
-			continue
+			bytePacket[0] = controlByte
+			break
 		}
-		bytePacket[0] = controlByte
 	}
 }
