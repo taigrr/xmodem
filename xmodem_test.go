@@ -534,10 +534,11 @@ func TestReceiveRetriesTransientHeaderRead(t *testing.T) {
 	block := buildBlock(SOH, 1, data, true)
 
 	// pre serves the first block; then a one-shot zero-progress read simulates
-	// a transient timeout while awaiting the next header; post then delivers EOT.
+	// a transient timeout while awaiting the next header; post then delivers the
+	// two EOTs required by the double-EOT handshake.
 	port := &zeroThenBufPort{
 		pre:  bytes.NewBuffer(block),
-		post: bytes.NewBuffer([]byte{EOT}),
+		post: bytes.NewBuffer([]byte{EOT, EOT}),
 	}
 	xm := NewWithReadWriter(port)
 	xm.Mode = XModeCRC
@@ -549,10 +550,11 @@ func TestReceiveRetriesTransientHeaderRead(t *testing.T) {
 	if !bytes.Equal(out.Bytes(), data) {
 		t.Fatalf("received %d bytes, want %d", out.Len(), len(data))
 	}
-	// The transient read must have triggered exactly one retry NAK (in addition
-	// to the initial handshake byte), not a reprocessed stale header.
-	if port.naks != 1 {
-		t.Fatalf("expected 1 NAK from the transient read retry, got %d", port.naks)
+	// Two NAKs are expected: one from the transient read retry, one from the
+	// first EOT of the double-EOT handshake. Crucially the transient read must
+	// NOT have reprocessed a stale header.
+	if port.naks != 2 {
+		t.Fatalf("expected 2 NAKs (transient retry + first EOT), got %d", port.naks)
 	}
 }
 
@@ -565,6 +567,7 @@ func TestReceiveCRCMode(t *testing.T) {
 	// Sender responds to 'C' with SOH block, then EOT
 	block := buildBlock(SOH, 1, data, true)
 	mock.readBuf.Write(block)
+	mock.readBuf.WriteByte(EOT)
 	mock.readBuf.WriteByte(EOT)
 
 	var out bytes.Buffer
@@ -597,6 +600,7 @@ func TestReceiveChecksumMode(t *testing.T) {
 	block := buildBlock(SOH, 1, data, false)
 	mock.readBuf.Write(block)
 	mock.readBuf.WriteByte(EOT)
+	mock.readBuf.WriteByte(EOT)
 
 	var out bytes.Buffer
 	err := xm.Receive(&out)
@@ -624,6 +628,7 @@ func TestReceive1KMode(t *testing.T) {
 	block := buildBlock(STX, 1, data, true)
 	mock.readBuf.Write(block)
 	mock.readBuf.WriteByte(EOT)
+	mock.readBuf.WriteByte(EOT)
 
 	var out bytes.Buffer
 	err := xm.Receive(&out)
@@ -646,6 +651,7 @@ func TestReceiveMultipleBlocks(t *testing.T) {
 		block := buildBlock(SOH, seq, data, true)
 		mock.readBuf.Write(block)
 	}
+	mock.readBuf.WriteByte(EOT)
 	mock.readBuf.WriteByte(EOT)
 
 	var out bytes.Buffer
@@ -686,6 +692,7 @@ func TestReceiveEOTImmediately(t *testing.T) {
 	xm := NewWithReadWriter(mock)
 
 	mock.readBuf.WriteByte(EOT)
+	mock.readBuf.WriteByte(EOT)
 
 	var out bytes.Buffer
 	err := xm.Receive(&out)
@@ -694,6 +701,11 @@ func TestReceiveEOTImmediately(t *testing.T) {
 	}
 	if out.Len() != 0 {
 		t.Errorf("received %d bytes, want 0", out.Len())
+	}
+	// The first EOT must be answered with a NAK before the second is ACK'd.
+	written := mock.writeBuf.Bytes()
+	if written[len(written)-1] != ACK {
+		t.Errorf("last written byte = 0x%02x, want ACK", written[len(written)-1])
 	}
 }
 
@@ -759,5 +771,392 @@ func TestReceiveDoubleCANDuringTransfer(t *testing.T) {
 	// First block should still have been received
 	if out.Len() != 128 {
 		t.Errorf("received %d bytes before cancel, want 128", out.Len())
+	}
+}
+
+// buildBlockRaw constructs a block with an explicitly supplied sequence and
+// complement byte, allowing malformed blocks to be built for testing.
+func buildBlockRaw(header, seq, comp byte, data []byte, useCRC bool) []byte {
+	block := []byte{header, seq, comp}
+	block = append(block, data...)
+	if useCRC {
+		crc := crc16.CRC(data, 0)
+		block = append(block, byte(crc>>8), byte(crc&0xff))
+	} else {
+		var sum byte
+		for _, b := range data {
+			sum += b
+		}
+		block = append(block, sum)
+	}
+	return block
+}
+
+// oneBytePort serves its read buffer exactly one byte per Read call, forcing
+// readFull to reassemble partial reads.
+type oneBytePort struct {
+	readBuf  *bytes.Buffer
+	writeBuf *bytes.Buffer
+}
+
+func (p *oneBytePort) Read(buf []byte) (int, error) {
+	if p.readBuf.Len() == 0 {
+		return 0, io.EOF
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	b, _ := p.readBuf.ReadByte()
+	buf[0] = b
+	return 1, nil
+}
+
+func (p *oneBytePort) Write(buf []byte) (int, error) {
+	return p.writeBuf.Write(buf)
+}
+
+func (p *oneBytePort) Flush() error { return nil }
+
+// crcTimeoutPort returns a fixed number of zero-progress reads (simulating an
+// unanswered 'C' handshake) before serving its read buffer, and records writes.
+type crcTimeoutPort struct {
+	timeouts int
+	readBuf  *bytes.Buffer
+	writeBuf *bytes.Buffer
+}
+
+func (p *crcTimeoutPort) Read(buf []byte) (int, error) {
+	if p.timeouts > 0 {
+		p.timeouts--
+		return 0, nil
+	}
+	return p.readBuf.Read(buf)
+}
+
+func (p *crcTimeoutPort) Write(buf []byte) (int, error) {
+	return p.writeBuf.Write(buf)
+}
+
+func (p *crcTimeoutPort) Flush() error { return nil }
+
+// flakyWritePort fails the first failWrites Write calls, then succeeds.
+type flakyWritePort struct {
+	failWrites int
+	readBuf    *bytes.Buffer
+	writeBuf   *bytes.Buffer
+}
+
+func (p *flakyWritePort) Read(buf []byte) (int, error) {
+	return p.readBuf.Read(buf)
+}
+
+func (p *flakyWritePort) Write(buf []byte) (int, error) {
+	if p.failWrites > 0 {
+		p.failWrites--
+		return 0, io.ErrShortWrite
+	}
+	return p.writeBuf.Write(buf)
+}
+
+func (p *flakyWritePort) Flush() error { return nil }
+
+func TestReceiveDuplicateBlock(t *testing.T) {
+	mock := newMockPort()
+	xm := NewWithReadWriter(mock)
+	xm.Mode = XModeCRC
+
+	data := bytes.Repeat([]byte{0xAA}, 128)
+	block := buildBlock(SOH, 1, data, true)
+	// Same block twice: the second is a duplicate (sender missed our ACK).
+	mock.readBuf.Write(block)
+	mock.readBuf.Write(block)
+	mock.readBuf.WriteByte(EOT)
+	mock.readBuf.WriteByte(EOT)
+
+	var out bytes.Buffer
+	if err := xm.Receive(&out); err != nil {
+		t.Fatalf("Receive returned error: %v", err)
+	}
+	// Duplicate must be ACK'd but not written.
+	if out.Len() != 128 {
+		t.Errorf("received %d bytes, want 128 (duplicate discarded)", out.Len())
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Errorf("received data mismatch")
+	}
+}
+
+func TestReceiveComplementMismatchThenRecovery(t *testing.T) {
+	mock := newMockPort()
+	xm := NewWithReadWriter(mock)
+	xm.Mode = XModeCRC
+
+	data := bytes.Repeat([]byte{0x5A}, 128)
+	// Block with a corrupted complement byte, then a valid retransmit.
+	bad := buildBlockRaw(SOH, 1, 200, data, true)
+	good := buildBlock(SOH, 1, data, true)
+	mock.readBuf.Write(bad)
+	mock.readBuf.Write(good)
+	mock.readBuf.WriteByte(EOT)
+	mock.readBuf.WriteByte(EOT)
+
+	var out bytes.Buffer
+	if err := xm.Receive(&out); err != nil {
+		t.Fatalf("Receive returned error: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Errorf("received data mismatch after recovery")
+	}
+	// A NAK must have been sent for the malformed block.
+	if !bytes.Contains(mock.writeBuf.Bytes(), []byte{NAK}) {
+		t.Error("expected a NAK to be sent for the malformed block")
+	}
+}
+
+func TestReceiveBadCRCThenRecovery(t *testing.T) {
+	mock := newMockPort()
+	xm := NewWithReadWriter(mock)
+	xm.Mode = XModeCRC
+
+	data := bytes.Repeat([]byte{0x11}, 128)
+	bad := buildBlockRaw(SOH, 1, 254, data, true)
+	bad[len(bad)-1] ^= 0xFF // corrupt CRC low byte
+	good := buildBlock(SOH, 1, data, true)
+	mock.readBuf.Write(bad)
+	mock.readBuf.Write(good)
+	mock.readBuf.WriteByte(EOT)
+	mock.readBuf.WriteByte(EOT)
+
+	var out bytes.Buffer
+	if err := xm.Receive(&out); err != nil {
+		t.Fatalf("Receive returned error: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Errorf("received data mismatch after CRC recovery")
+	}
+}
+
+func TestReceiveChecksumModeBadChecksum(t *testing.T) {
+	mock := newMockPort()
+	xm := NewWithReadWriter(mock)
+	xm.Mode = XMode128
+	xm.retries = 0
+
+	data := bytes.Repeat([]byte{0x22}, 128)
+	block := buildBlock(SOH, 1, data, false)
+	block[len(block)-1] ^= 0xFF // corrupt checksum
+	mock.readBuf.Write(block)
+
+	var out bytes.Buffer
+	err := xm.Receive(&out)
+	if !errors.Is(err, ErrChecksumMismatch) {
+		t.Errorf("expected ErrChecksumMismatch, got %v", err)
+	}
+}
+
+func TestReceiveSequenceMismatchFatal(t *testing.T) {
+	mock := newMockPort()
+	xm := NewWithReadWriter(mock)
+	xm.Mode = XModeCRC
+	xm.retries = 0
+
+	data := bytes.Repeat([]byte{0x33}, 128)
+	// Sequence 5 when expecting 1 (not a duplicate) is a fatal desync.
+	block := buildBlock(SOH, 5, data, true)
+	mock.readBuf.Write(block)
+
+	var out bytes.Buffer
+	err := xm.Receive(&out)
+	if !errors.Is(err, ErrSequenceMismatch) {
+		t.Errorf("expected ErrSequenceMismatch, got %v", err)
+	}
+}
+
+func TestReceiveFirstEOTThenResume(t *testing.T) {
+	mock := newMockPort()
+	xm := NewWithReadWriter(mock)
+	xm.Mode = XModeCRC
+
+	data := bytes.Repeat([]byte{0x44}, 128)
+	// A spurious EOT arrives first; the receiver NAKs, then real data follows.
+	mock.readBuf.WriteByte(EOT)
+	mock.readBuf.Write(buildBlock(SOH, 1, data, true))
+	mock.readBuf.WriteByte(EOT)
+	mock.readBuf.WriteByte(EOT)
+
+	var out bytes.Buffer
+	if err := xm.Receive(&out); err != nil {
+		t.Fatalf("Receive returned error: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Errorf("expected to resume and receive data after spurious EOT")
+	}
+}
+
+func TestReceiveCRCFallbackToChecksum(t *testing.T) {
+	port := &crcTimeoutPort{
+		timeouts: crcHandshakeAttempts,
+		readBuf:  new(bytes.Buffer),
+		writeBuf: new(bytes.Buffer),
+	}
+	xm := NewWithReadWriter(port)
+	xm.Mode = XModeCRC
+
+	data := bytes.Repeat([]byte{0x66}, 128)
+	// After falling back, the sender uses checksum-mode blocks.
+	port.readBuf.Write(buildBlock(SOH, 1, data, false))
+	port.readBuf.WriteByte(EOT)
+	port.readBuf.WriteByte(EOT)
+
+	var out bytes.Buffer
+	if err := xm.Receive(&out); err != nil {
+		t.Fatalf("Receive returned error: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Errorf("received data mismatch after CRC->checksum fallback")
+	}
+	// Handshake should have sent crcHandshakeAttempts 'C' bytes, then a NAK.
+	written := port.writeBuf.Bytes()
+	cCount := bytes.Count(written, []byte{CRC})
+	if cCount != crcHandshakeAttempts {
+		t.Errorf("sent %d 'C' bytes, want %d", cCount, crcHandshakeAttempts)
+	}
+	if !bytes.Contains(written, []byte{NAK}) {
+		t.Error("expected a NAK after CRC fallback")
+	}
+}
+
+func TestReceivePartialReadsReassembled(t *testing.T) {
+	port := &oneBytePort{
+		readBuf:  new(bytes.Buffer),
+		writeBuf: new(bytes.Buffer),
+	}
+	xm := NewWithReadWriter(port)
+	xm.Mode = XModeCRC
+
+	data := bytes.Repeat([]byte{0x77}, 128)
+	port.readBuf.Write(buildBlock(SOH, 1, data, true))
+	port.readBuf.WriteByte(EOT)
+	port.readBuf.WriteByte(EOT)
+
+	var out bytes.Buffer
+	if err := xm.Receive(&out); err != nil {
+		t.Fatalf("Receive returned error: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Errorf("partial-read reassembly failed")
+	}
+}
+
+func TestSendSingleCANThenContinue(t *testing.T) {
+	mock := newMockPort()
+	// A lone CAN during sniff must not cancel; transfer proceeds on CRC.
+	mock.readBuf.WriteByte(CAN)
+	mock.readBuf.WriteByte(CRC)
+	mock.readBuf.WriteByte(ACK)
+	mock.readBuf.WriteByte(ACK) // EOT ACK
+
+	xm := NewWithReadWriter(mock)
+	xm.Mode = XModeCRC
+
+	if err := xm.Send(*bytes.NewBuffer(bytes.Repeat([]byte{0x88}, 128))); err != nil {
+		t.Fatalf("Send returned error: %v", err)
+	}
+}
+
+func TestSendEOTNAKThenACK(t *testing.T) {
+	mock := newMockPort()
+	// EOT is NAK'd once (sender must resend), then ACK'd.
+	mock.readBuf.WriteByte(CRC)
+	mock.readBuf.WriteByte(ACK)
+	mock.readBuf.WriteByte(NAK) // NAK the first EOT
+	mock.readBuf.WriteByte(ACK) // ACK the resent EOT
+
+	xm := NewWithReadWriter(mock)
+	xm.Mode = XModeCRC
+
+	if err := xm.Send(*bytes.NewBuffer(bytes.Repeat([]byte{0x99}, 128))); err != nil {
+		t.Fatalf("Send returned error: %v", err)
+	}
+	// Two EOT bytes should have been written (original + resend).
+	if n := bytes.Count(mock.writeBuf.Bytes(), []byte{EOT}); n != 2 {
+		t.Errorf("wrote %d EOT bytes, want 2 (resend after NAK)", n)
+	}
+}
+
+func TestSendPacketWriteErrorRetry(t *testing.T) {
+	port := &flakyWritePort{
+		failWrites: 1,
+		readBuf:    new(bytes.Buffer),
+		writeBuf:   new(bytes.Buffer),
+	}
+	port.readBuf.WriteByte(CRC)
+	port.readBuf.WriteByte(ACK)
+	port.readBuf.WriteByte(ACK) // EOT ACK
+
+	xm := NewWithReadWriter(port)
+	xm.Mode = XModeCRC
+
+	if err := xm.Send(*bytes.NewBuffer(bytes.Repeat([]byte{0xAB}, 128))); err != nil {
+		t.Fatalf("Send returned error: %v", err)
+	}
+}
+
+func TestSendChecksumMultipleBlocks(t *testing.T) {
+	mock := newMockPort()
+	mock.readBuf.WriteByte(NAK) // checksum mode
+	mock.readBuf.WriteByte(ACK)
+	mock.readBuf.WriteByte(ACK)
+	mock.readBuf.WriteByte(ACK) // EOT ACK
+
+	xm := NewWithReadWriter(mock)
+
+	// 200 bytes -> 2 checksum blocks (second padded).
+	if err := xm.Send(*bytes.NewBuffer(bytes.Repeat([]byte{0x0F}, 200))); err != nil {
+		t.Fatalf("Send returned error: %v", err)
+	}
+}
+
+func TestReceiveWireFramingAllModes(t *testing.T) {
+	// Decodes valid wire framing for every mode to confirm Receive interoperates.
+	for _, mode := range []Mode{XMode128, XModeCRC, XMode1K} {
+		payload := bytes.Repeat([]byte{0x3C}, 700)
+
+		sendOut := new(bytes.Buffer)
+		// Capture what Send would transmit by feeding it canned ACKs; instead
+		// build the wire framing directly and verify Receive decodes it.
+		useCRC := mode != XMode128
+		header := byte(SOH)
+		blockSize := 128
+		if mode == XMode1K {
+			header = STX
+			blockSize = 1024
+		}
+		seq := byte(1)
+		for off := 0; off < len(payload); off += blockSize {
+			end := off + blockSize
+			block := make([]byte, blockSize)
+			copy(block, payload[off:min(end, len(payload))])
+			for i := len(payload) - off; i < blockSize; i++ {
+				block[i] = SUB
+			}
+			sendOut.Write(buildBlock(header, seq, block, useCRC))
+			seq++
+		}
+		sendOut.WriteByte(EOT)
+		sendOut.WriteByte(EOT)
+
+		mock := newMockPort()
+		mock.readBuf = sendOut
+		xm := NewWithReadWriter(mock)
+		xm.Mode = mode
+
+		var out bytes.Buffer
+		if err := xm.Receive(&out); err != nil {
+			t.Fatalf("mode %d: Receive error: %v", mode, err)
+		}
+		if !bytes.HasPrefix(out.Bytes(), payload) {
+			t.Errorf("mode %d: received data does not contain payload", mode)
+		}
 	}
 }

@@ -35,6 +35,11 @@ const (
 	XMode1K              // XMODEM-1K with 1024-byte blocks and CRC
 )
 
+// crcHandshakeAttempts is the number of 'C' (CRC-request) handshake bytes a
+// receiver sends without a valid response before falling back to NAK
+// (checksum) mode, per the XMODEM-CRC standard.
+const crcHandshakeAttempts = 3
+
 type (
 	// Mode represents the XMODEM protocol variant.
 	Mode int
@@ -353,7 +358,7 @@ func (x Xmodem) receiveBlock(header byte, useCRC bool, expectedSeq byte) (data [
 		return nil, false, fmt.Errorf("unexpected header byte 0x%02x", header)
 	}
 
-	// Read sequence number and complement
+	// Read sequence number and complement.
 	seqBuf := make([]byte, 2)
 	if err := x.readFull(seqBuf); err != nil {
 		return nil, false, fmt.Errorf("reading sequence: %w", err)
@@ -362,35 +367,47 @@ func (x Xmodem) receiveBlock(header byte, useCRC bool, expectedSeq byte) (data [
 	seq := seqBuf[0]
 	seqComp := seqBuf[1]
 
-	// Verify complement
-	if seq+seqComp != 255 {
-		return nil, false, fmt.Errorf("%w: seq=%d comp=%d", ErrSequenceMismatch, seq, seqComp)
-	}
-
-	// Read data block
+	// Read the data block and checksum/CRC. The entire frame is consumed
+	// before any validation so that a rejected block does not leave stray
+	// bytes in the stream and desynchronize subsequent reads.
 	data = make([]byte, blockSize)
 	if err := x.readFull(data); err != nil {
 		return nil, false, fmt.Errorf("reading data: %w", err)
 	}
 
-	// Read and verify checksum/CRC
+	var (
+		receivedCRC, computedCRC uint16
+		receivedCS, computedCS   byte
+	)
 	if useCRC {
 		crcBuf := make([]byte, 2)
 		if err := x.readFull(crcBuf); err != nil {
 			return nil, false, fmt.Errorf("reading CRC: %w", err)
 		}
-		receivedCRC := uint16(crcBuf[0])<<8 | uint16(crcBuf[1])
-		computedCRC := crc16.CRC(data, 0)
-		if receivedCRC != computedCRC {
-			return nil, false, fmt.Errorf("%w: received 0x%04x, computed 0x%04x", ErrChecksumMismatch, receivedCRC, computedCRC)
-		}
+		receivedCRC = uint16(crcBuf[0])<<8 | uint16(crcBuf[1])
+		computedCRC = crc16.CRC(data, 0)
 	} else {
 		csBuf := make([]byte, 1)
 		if err := x.readFull(csBuf); err != nil {
 			return nil, false, fmt.Errorf("reading checksum: %w", err)
 		}
-		if csBuf[0] != checksum8(data) {
-			return nil, false, fmt.Errorf("%w: received 0x%02x, computed 0x%02x", ErrChecksumMismatch, csBuf[0], checksum8(data))
+		receivedCS = csBuf[0]
+		computedCS = checksum8(data)
+	}
+
+	// Verify complement now that the full frame has been consumed.
+	if seq+seqComp != 255 {
+		return nil, false, fmt.Errorf("%w: seq=%d comp=%d", ErrSequenceMismatch, seq, seqComp)
+	}
+
+	// Verify checksum/CRC.
+	if useCRC {
+		if receivedCRC != computedCRC {
+			return nil, false, fmt.Errorf("%w: received 0x%04x, computed 0x%04x", ErrChecksumMismatch, receivedCRC, computedCRC)
+		}
+	} else {
+		if receivedCS != computedCS {
+			return nil, false, fmt.Errorf("%w: received 0x%02x, computed 0x%02x", ErrChecksumMismatch, receivedCS, computedCS)
 		}
 	}
 
@@ -413,8 +430,11 @@ func (x Xmodem) receiveBlock(header byte, useCRC bool, expectedSeq byte) (data [
 
 // Receive accepts an incoming XMODEM transfer and writes the received data to w.
 // The receiver initiates by sending 'C' (for CRC/1K modes) or NAK (for checksum
-// mode) to the sender. Blocks are verified and acknowledged until the sender
-// signals end of transmission with EOT.
+// mode) to the sender. If the sender does not respond to 'C' after
+// crcHandshakeAttempts, the receiver falls back to checksum mode. Blocks are
+// verified and acknowledged until the sender signals end of transmission. Per
+// the XMODEM standard, the first EOT is answered with NAK and a second EOT is
+// required before the transfer is acknowledged as complete.
 //
 // Note: the received data may include trailing padding bytes (default SUB/0x1A)
 // that the sender used to fill the last block. The caller is responsible for
@@ -431,7 +451,10 @@ func (x Xmodem) Receive(w io.Writer) error {
 
 	x.port.Flush()
 
-	// Send initial handshake byte to tell sender we're ready
+	// Send initial handshake byte to tell sender we're ready. In CRC/1K mode
+	// we send 'C'; if the sender does not respond after crcHandshakeAttempts,
+	// fall back to NAK (checksum) mode as required by the XMODEM-CRC standard.
+	crcAttempts := 0
 	for !handshakeDone && errorCount <= x.retries {
 		var initByte byte
 		if useCRC {
@@ -450,6 +473,13 @@ func (x Xmodem) Receive(w io.Writer) error {
 		if err != nil {
 			log.Errorf("Timeout waiting for sender: %v", err)
 			errorCount++
+			if useCRC {
+				crcAttempts++
+				if crcAttempts >= crcHandshakeAttempts {
+					log.Debugf("receive: no CRC response after %d attempts, falling back to checksum", crcAttempts)
+					useCRC = false
+				}
+			}
 			continue
 		}
 
@@ -470,20 +500,28 @@ func (x Xmodem) Receive(w io.Writer) error {
 		return ErrTransferCanceled
 	}
 
+	eotConfirmed := false
 	// Main receive loop
 	for {
 		header := bytePacket[0]
 
-		// Handle EOT
-		if header == EOT {
-			log.Info("receive: EOT received, sending ACK")
-			x.port.Write([]byte{ACK})
-			log.Printf("receive: transfer complete, %d blocks received", totalReceived)
-			return nil
-		}
-
-		// Handle CAN
-		if header == CAN {
+		switch header {
+		case EOT:
+			// Per the XMODEM standard, NAK the first EOT and require a second
+			// EOT before acknowledging, to guard against a spurious EOT caused
+			// by line noise. If real data (SOH/STX) arrives instead, the
+			// transfer resumes and eotConfirmed is reset below.
+			if !eotConfirmed {
+				log.Debugf("receive: first EOT, sending NAK to confirm")
+				eotConfirmed = true
+				x.port.Write([]byte{NAK})
+			} else {
+				log.Info("receive: EOT confirmed, sending ACK")
+				x.port.Write([]byte{ACK})
+				log.Printf("receive: transfer complete, %d blocks received", totalReceived)
+				return nil
+			}
+		case CAN:
 			if controlByte, err := x.readByte(); err == nil && controlByte == CAN {
 				log.Errorf("receive: double CAN, transfer canceled")
 				return ErrTransferCanceled
@@ -494,7 +532,7 @@ func (x Xmodem) Receive(w io.Writer) error {
 				return ErrTransferCanceled
 			}
 			x.port.Write([]byte{NAK})
-		} else if header == SOH || header == STX {
+		case SOH, STX:
 			data, isDuplicate, err := x.receiveBlock(header, useCRC, expectedSeq)
 			if err != nil {
 				log.Errorf("receive: block error: %v", err)
@@ -506,6 +544,7 @@ func (x Xmodem) Receive(w io.Writer) error {
 				x.port.Write([]byte{NAK})
 			} else if isDuplicate {
 				errorCount = 0
+				eotConfirmed = false
 				x.port.Write([]byte{ACK})
 			} else {
 				if _, err := w.Write(data); err != nil {
@@ -514,12 +553,13 @@ func (x Xmodem) Receive(w io.Writer) error {
 					return err
 				}
 				errorCount = 0
+				eotConfirmed = false
 				expectedSeq = byte((int(expectedSeq) + 1) % 256)
 				totalReceived++
 				log.Tracef("receive: block %d ACK'd", totalReceived)
 				x.port.Write([]byte{ACK})
 			}
-		} else {
+		default:
 			log.Errorf("receive: unexpected header byte 0x%02x", header)
 			errorCount++
 			if errorCount > x.retries {
