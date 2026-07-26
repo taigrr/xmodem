@@ -1284,3 +1284,48 @@ func TestReceiveBlockResendAfterEOTCompletes(t *testing.T) {
 		t.Errorf("received data mismatch")
 	}
 }
+
+func TestReceiveCANDuringEOTConfirm(t *testing.T) {
+	// A CAN CAN arriving after our EOT-NAK must cancel, not be swallowed as a
+	// successful completion.
+	mock := newMockPort()
+	xm := NewWithReadWriter(mock)
+	xm.Mode = XModeCRC
+
+	data := bytes.Repeat([]byte{0x5C}, 128)
+	mock.readBuf.Write(buildBlock(SOH, 1, data, true))
+	mock.readBuf.WriteByte(EOT) // -> we NAK
+	mock.readBuf.WriteByte(CAN)
+	mock.readBuf.WriteByte(CAN)
+
+	var out bytes.Buffer
+	err := xm.Receive(&out)
+	if !errors.Is(err, ErrTransferCanceled) {
+		t.Errorf("expected ErrTransferCanceled, got %v", err)
+	}
+}
+
+func TestReceiveCRCFallbackOnGarbage(t *testing.T) {
+	// A sender that answers 'C' with garbage (never a valid header) must still
+	// trigger the CRC->checksum fallback.
+	mock := newMockPort()
+	xm := NewWithReadWriter(mock)
+	xm.Mode = XModeCRC
+
+	// crcHandshakeAttempts garbage bytes, then a valid checksum-mode transfer.
+	for i := 0; i < crcHandshakeAttempts; i++ {
+		mock.readBuf.WriteByte(0x00)
+	}
+	data := bytes.Repeat([]byte{0x6D}, 128)
+	mock.readBuf.Write(buildBlock(SOH, 1, data, false))
+	mock.readBuf.WriteByte(EOT)
+	mock.readBuf.WriteByte(EOT)
+
+	var out bytes.Buffer
+	if err := xm.Receive(&out); err != nil {
+		t.Fatalf("Receive returned error: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Errorf("received data mismatch after garbage-triggered fallback")
+	}
+}

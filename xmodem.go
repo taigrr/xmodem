@@ -460,6 +460,22 @@ func (x Xmodem) Receive(w io.Writer) error {
 	// fall back to NAK (checksum) mode as required by the XMODEM-CRC standard.
 	// XMODEM-1K is CRC-only, so it never falls back.
 	crcAttempts := 0
+	// noteNoCRCResponse advances the CRC handshake counter and falls back to
+	// checksum mode once the sender has failed to give a usable CRC response
+	// crcHandshakeAttempts times (whether by silence or garbage). XMODEM-1K is
+	// CRC-only and never falls back.
+	noteNoCRCResponse := func() {
+		if !useCRC || x.Mode == XMode1K {
+			return
+		}
+		crcAttempts++
+		if crcAttempts >= crcHandshakeAttempts {
+			log.Debugf("receive: no CRC response after %d attempts, falling back to checksum", crcAttempts)
+			useCRC = false
+			// Give checksum mode a fresh error budget.
+			errorCount = 0
+		}
+	}
 	for !handshakeDone && errorCount <= x.retries {
 		var initByte byte
 		if useCRC {
@@ -478,15 +494,7 @@ func (x Xmodem) Receive(w io.Writer) error {
 		if err != nil {
 			log.Errorf("Timeout waiting for sender: %v", err)
 			errorCount++
-			if useCRC && x.Mode != XMode1K {
-				crcAttempts++
-				if crcAttempts >= crcHandshakeAttempts {
-					log.Debugf("receive: no CRC response after %d attempts, falling back to checksum", crcAttempts)
-					useCRC = false
-					// Give checksum mode a fresh error budget.
-					errorCount = 0
-				}
-			}
+			noteNoCRCResponse()
 			continue
 		}
 
@@ -500,6 +508,7 @@ func (x Xmodem) Receive(w io.Writer) error {
 		default:
 			log.Debugf("Unexpected byte during handshake: 0x%02x", controlByte)
 			errorCount++
+			noteNoCRCResponse()
 		}
 	}
 	if !handshakeDone {
@@ -535,6 +544,11 @@ mainLoop:
 				if controlByte == EOT {
 					break
 				}
+				if controlByte == CAN {
+					// A cancel during confirmation must not be swallowed.
+					bytePacket[0] = CAN
+					continue mainLoop
+				}
 				if controlByte == SOH || controlByte == STX {
 					log.Debugf("receive: data after EOT, evaluating block")
 					eotSeen = true
@@ -566,6 +580,11 @@ mainLoop:
 			}
 			x.port.Write([]byte{NAK})
 		case SOH, STX:
+			// afterEOT is consumed as a one-shot: only the block immediately
+			// following an EOT-NAK is treated as a possible end-of-transfer
+			// resend, so a stale flag cannot later short-circuit the transfer.
+			afterEOT := eotSeen
+			eotSeen = false
 			data, isDuplicate, err := x.receiveBlock(header, useCRC, expectedSeq)
 			if err != nil {
 				log.Errorf("receive: block error: %v", err)
@@ -576,7 +595,7 @@ mainLoop:
 				}
 				x.port.Write([]byte{NAK})
 			} else if isDuplicate {
-				if eotSeen {
+				if afterEOT {
 					// The sender resent the last block in response to our
 					// EOT-NAK: the transfer is already fully received. ACK the
 					// block and complete rather than failing it.
@@ -602,7 +621,6 @@ mainLoop:
 					return err
 				}
 				errorCount = 0
-				eotSeen = false
 				expectedSeq = byte((int(expectedSeq) + 1) % 256)
 				totalReceived++
 				log.Tracef("receive: block %d ACK'd", totalReceived)
