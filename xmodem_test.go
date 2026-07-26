@@ -1160,3 +1160,59 @@ func TestReceiveWireFramingAllModes(t *testing.T) {
 		}
 	}
 }
+
+func TestReceiveSingleEOTCompletes(t *testing.T) {
+	// A sender that transmits a single EOT and does not resend on NAK must
+	// still complete successfully with all data intact.
+	mock := newMockPort()
+	xm := NewWithReadWriter(mock)
+	xm.Mode = XModeCRC
+
+	data := bytes.Repeat([]byte{0xC3}, 128)
+	mock.readBuf.Write(buildBlock(SOH, 1, data, true))
+	mock.readBuf.WriteByte(EOT) // only one EOT
+
+	var out bytes.Buffer
+	if err := xm.Receive(&out); err != nil {
+		t.Fatalf("Receive returned error for single-EOT sender: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Errorf("received data mismatch")
+	}
+	// The transfer must still be ACK'd despite the single EOT.
+	written := mock.writeBuf.Bytes()
+	if written[len(written)-1] != ACK {
+		t.Errorf("last written byte = 0x%02x, want ACK", written[len(written)-1])
+	}
+}
+
+func TestReceive1KNoChecksumFallback(t *testing.T) {
+	// XMODEM-1K is CRC-only: unanswered 'C' handshakes must never fall back to
+	// checksum/NAK mode.
+	port := &crcTimeoutPort{
+		timeouts: crcHandshakeAttempts + 2,
+		readBuf:  new(bytes.Buffer),
+		writeBuf: new(bytes.Buffer),
+	}
+	xm := NewWithReadWriter(port)
+	xm.Mode = XMode1K
+
+	data := bytes.Repeat([]byte{0xD4}, 1024)
+	port.readBuf.Write(buildBlock(STX, 1, data, true))
+	port.readBuf.WriteByte(EOT)
+	port.readBuf.WriteByte(EOT)
+
+	var out bytes.Buffer
+	if err := xm.Receive(&out); err != nil {
+		t.Fatalf("Receive returned error: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Errorf("received data mismatch in 1K mode")
+	}
+	// It must keep sending 'C' past crcHandshakeAttempts rather than switching
+	// to NAK/checksum handshakes (a checksum fallback would misdecode the
+	// CRC-framed 1K block and fail before reaching here).
+	if n := bytes.Count(port.writeBuf.Bytes(), []byte{CRC}); n <= crcHandshakeAttempts {
+		t.Errorf("sent %d 'C' handshake bytes, want > %d (no fallback)", n, crcHandshakeAttempts)
+	}
+}
