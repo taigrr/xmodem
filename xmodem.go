@@ -45,7 +45,9 @@ type (
 	Mode int
 
 	// Port abstracts a serial port for reading, writing, and flushing.
-	// *serial.Port satisfies this interface.
+	// *serial.Port satisfies this interface. A Read that returns (0, nil) is
+	// treated as a timeout/no-progress condition (as tarm/serial does when its
+	// ReadTimeout elapses) and counts against the retry budget.
 	Port interface {
 		io.ReadWriter
 		Flush() error
@@ -570,8 +572,15 @@ mainLoop:
 				}
 				x.port.Write([]byte{NAK})
 			} else if isDuplicate {
-				// ACK the duplicate but do not reset errorCount: doing so
-				// would remove the retry ceiling that bounds a stuck sender.
+				// ACK the duplicate (the sender missed our previous ACK), but
+				// count it against the retry ceiling so a sender stuck resending
+				// an already-received block — or ping-ponging block/EOT after our
+				// EOT-NAK — cannot loop forever. A fresh block resets the count.
+				errorCount++
+				if errorCount > x.retries {
+					x.Abort()
+					return ErrTransferCanceled
+				}
 				x.port.Write([]byte{ACK})
 			} else {
 				if _, err := w.Write(data); err != nil {

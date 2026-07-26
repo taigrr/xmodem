@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/taigrr/xmodem/crc16"
 )
@@ -1214,5 +1215,49 @@ func TestReceive1KNoChecksumFallback(t *testing.T) {
 	// CRC-framed 1K block and fail before reaching here).
 	if n := bytes.Count(port.writeBuf.Bytes(), []byte{CRC}); n <= crcHandshakeAttempts {
 		t.Errorf("sent %d 'C' handshake bytes, want > %d (no fallback)", n, crcHandshakeAttempts)
+	}
+}
+
+// repeatBlockPort serves the same block forever and discards writes, modeling a
+// sender stuck resending an already-received block (never sees our ACKs).
+type repeatBlockPort struct {
+	block []byte
+	pos   int
+}
+
+func (p *repeatBlockPort) Read(buf []byte) (int, error) {
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	buf[0] = p.block[p.pos]
+	p.pos = (p.pos + 1) % len(p.block)
+	return 1, nil
+}
+
+func (p *repeatBlockPort) Write(buf []byte) (int, error) { return len(buf), nil }
+func (p *repeatBlockPort) Flush() error                  { return nil }
+
+func TestReceiveDuplicateLivelockBounded(t *testing.T) {
+	// A sender that endlessly resends the same block must not loop forever;
+	// the duplicate retry ceiling has to abort the transfer.
+	data := bytes.Repeat([]byte{0xA5}, 128)
+	port := &repeatBlockPort{block: buildBlock(SOH, 1, data, true)}
+	xm := NewWithReadWriter(port)
+	xm.Mode = XModeCRC
+	xm.retries = 5
+
+	done := make(chan error, 1)
+	go func() {
+		var out bytes.Buffer
+		done <- xm.Receive(&out)
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrTransferCanceled) {
+			t.Fatalf("expected ErrTransferCanceled from bounded livelock, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Receive did not terminate: duplicate livelock is unbounded")
 	}
 }
