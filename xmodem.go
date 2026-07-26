@@ -142,7 +142,7 @@ protocolSniff:
 		if err != nil {
 			log.Errorf("Error reading from port: %v", err)
 			errorCount++
-			if errorCount > 10 {
+			if errorCount > x.retries {
 				log.Errorf("Too many errors, aborting transfer")
 				return err
 			}
@@ -537,6 +537,9 @@ func (x Xmodem) Receive(w io.Writer) error {
 				x.Abort()
 				return err
 			}
+			// Invalidate the header so a failed read never re-drives the
+			// state machine with the previous (stale) header byte.
+			bytePacket[0] = 0
 			continue
 		}
 		bytePacket[0] = controlByte

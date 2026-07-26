@@ -195,6 +195,39 @@ func TestSendReturnsNoProgressAwaitingEOTACK(t *testing.T) {
 	}
 }
 
+type countingZeroProgressPort struct {
+	reads int
+}
+
+func (p *countingZeroProgressPort) Read(_ []byte) (int, error) {
+	p.reads++
+	return 0, nil
+}
+
+func (p *countingZeroProgressPort) Write(buf []byte) (int, error) {
+	return len(buf), nil
+}
+
+func (p *countingZeroProgressPort) Flush() error {
+	return nil
+}
+
+func TestSendProtocolSniffRespectsRetries(t *testing.T) {
+	port := &countingZeroProgressPort{}
+	xm := NewWithReadWriter(port)
+	xm.retries = 3
+
+	err := xm.Send(*bytes.NewBuffer(nil))
+	if !errors.Is(err, io.ErrNoProgress) {
+		t.Fatalf("expected io.ErrNoProgress, got %v", err)
+	}
+	// protocolSniff aborts once errorCount exceeds x.retries, i.e. after
+	// retries+1 zero-progress reads. A hard-coded bound would over-read.
+	if port.reads != xm.retries+1 {
+		t.Fatalf("expected %d reads bounded by retries, got %d", xm.retries+1, port.reads)
+	}
+}
+
 func TestSendCRCMode(t *testing.T) {
 	mock := newMockPort()
 
