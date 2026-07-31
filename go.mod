@@ -1,6 +1,6 @@
 module github.com/taigrr/xmodem
 
-go 1.26.2
+go 1.26.5
 
 require (
 	github.com/taigrr/log-socket v1.0.6
