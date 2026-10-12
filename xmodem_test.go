@@ -16,6 +16,7 @@ type mockPort struct {
 	writeBuf *bytes.Buffer
 	readErr  error
 	writeErr error
+	flushErr error
 	flushed  bool
 }
 
@@ -41,6 +42,9 @@ func (mp *mockPort) Write(p []byte) (int, error) {
 }
 
 func (mp *mockPort) Flush() error {
+	if mp.flushErr != nil {
+		return mp.flushErr
+	}
 	mp.flushed = true
 	return nil
 }
@@ -198,6 +202,29 @@ func TestAbort(t *testing.T) {
 	written := mock.writeBuf.Bytes()
 	if len(written) != 2 || written[0] != CAN || written[1] != CAN {
 		t.Errorf("Abort wrote %v, want [CAN CAN]", written)
+	}
+}
+
+func TestSendReturnsFlushError(t *testing.T) {
+	mock := newMockPort()
+	mock.flushErr = io.ErrUnexpectedEOF
+	xm := NewWithReadWriter(mock)
+
+	err := xm.Send(*bytes.NewBuffer(nil))
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected flush error, got %v", err)
+	}
+}
+
+func TestReceiveReturnsFlushError(t *testing.T) {
+	mock := newMockPort()
+	mock.flushErr = io.ErrUnexpectedEOF
+	xm := NewWithReadWriter(mock)
+
+	var out bytes.Buffer
+	err := xm.Receive(&out)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected flush error, got %v", err)
 	}
 }
 
@@ -861,6 +888,28 @@ func (p *flakyWritePort) Write(buf []byte) (int, error) {
 
 func (p *flakyWritePort) Flush() error { return nil }
 
+// nthWriteShortPort short-writes a selected Write call and records all others.
+type nthWriteShortPort struct {
+	failOn   int
+	writes   int
+	readBuf  *bytes.Buffer
+	writeBuf *bytes.Buffer
+}
+
+func (p *nthWriteShortPort) Read(buf []byte) (int, error) {
+	return p.readBuf.Read(buf)
+}
+
+func (p *nthWriteShortPort) Write(buf []byte) (int, error) {
+	p.writes++
+	if p.writes == p.failOn {
+		return 0, nil
+	}
+	return p.writeBuf.Write(buf)
+}
+
+func (p *nthWriteShortPort) Flush() error { return nil }
+
 func TestReceiveDuplicateBlock(t *testing.T) {
 	mock := newMockPort()
 	xm := NewWithReadWriter(mock)
@@ -1100,6 +1149,30 @@ func TestSendPacketWriteErrorRetry(t *testing.T) {
 
 	if err := xm.Send(*bytes.NewBuffer(bytes.Repeat([]byte{0xAB}, 128))); err != nil {
 		t.Fatalf("Send returned error: %v", err)
+	}
+}
+
+func TestReceiveReturnsControlShortWrite(t *testing.T) {
+	data := bytes.Repeat([]byte{0xAA}, 128)
+	port := &nthWriteShortPort{
+		failOn:   4,
+		readBuf:  new(bytes.Buffer),
+		writeBuf: new(bytes.Buffer),
+	}
+	port.readBuf.Write(buildBlock(SOH, 1, data, true))
+	port.readBuf.WriteByte(EOT)
+	port.readBuf.WriteByte(EOT)
+
+	xm := NewWithReadWriter(port)
+	xm.Mode = XModeCRC
+
+	var out bytes.Buffer
+	err := xm.Receive(&out)
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("expected short write from final ACK, got %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), data) {
+		t.Errorf("received data mismatch before final ACK short write")
 	}
 }
 
