@@ -79,6 +79,17 @@ func (x Xmodem) Abort() {
 	x.port.Write([]byte{CAN, CAN})
 }
 
+func (x Xmodem) writeControl(controlByte byte) error {
+	n, err := x.port.Write([]byte{controlByte})
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
 // NewWithPort creates an Xmodem instance from an existing serial port.
 func NewWithPort(port *serial.Port) *Xmodem {
 	return newWithPort(port)
@@ -141,7 +152,9 @@ func (x Xmodem) Send(payload bytes.Buffer) error {
 		cancel     = 0
 		totalSent  = 0
 	)
-	x.port.Flush()
+	if err := x.port.Flush(); err != nil {
+		return err
+	}
 protocolSniff:
 	for {
 		// Listen for first NAK or CRC
@@ -278,8 +291,7 @@ protocolSniff:
 	for {
 		log.Info("sending EOT, awaiting ACK")
 		// End of transmission
-		_, err := x.port.Write([]byte{EOT})
-		if err != nil {
+		if err := x.writeControl(EOT); err != nil {
 			log.Errorf("Error writing EOT: %v", err)
 			errorCount++
 			if errorCount > x.retries {
@@ -453,7 +465,9 @@ func (x Xmodem) Receive(w io.Writer) error {
 		handshakeDone      = false
 	)
 
-	x.port.Flush()
+	if err := x.port.Flush(); err != nil {
+		return err
+	}
 
 	// Send initial handshake byte to tell sender we're ready. In CRC/1K mode
 	// we send 'C'; if the sender does not respond after crcHandshakeAttempts,
@@ -484,7 +498,7 @@ func (x Xmodem) Receive(w io.Writer) error {
 			initByte = NAK
 		}
 		log.Tracef("receive: sending handshake byte 0x%02x", initByte)
-		if _, err := x.port.Write([]byte{initByte}); err != nil {
+		if err := x.writeControl(initByte); err != nil {
 			log.Errorf("Error writing handshake: %v", err)
 			errorCount++
 			continue
@@ -534,7 +548,9 @@ mainLoop:
 			// (transfer already complete) or a fresh block (the EOT was
 			// spurious and we resume); eotSeen distinguishes the two below.
 			log.Debugf("receive: EOT received, sending NAK to confirm")
-			x.port.Write([]byte{NAK})
+			if err := x.writeControl(NAK); err != nil {
+				return err
+			}
 			for attempt := 0; attempt <= x.retries; attempt++ {
 				controlByte, err := x.readByte()
 				if err != nil {
@@ -558,7 +574,9 @@ mainLoop:
 				// Ignore anything else and keep waiting for confirmation.
 			}
 			log.Info("receive: EOT acknowledged, transfer complete")
-			x.port.Write([]byte{ACK})
+			if err := x.writeControl(ACK); err != nil {
+				return err
+			}
 			log.Printf("receive: transfer complete, %d blocks received", totalReceived)
 			return nil
 		case CAN:
@@ -578,7 +596,9 @@ mainLoop:
 				bytePacket[0] = controlByte
 				continue mainLoop
 			}
-			x.port.Write([]byte{NAK})
+			if err := x.writeControl(NAK); err != nil {
+				return err
+			}
 		case SOH, STX:
 			// afterEOT is consumed as a one-shot: only the block immediately
 			// following an EOT-NAK is treated as a possible end-of-transfer
@@ -593,14 +613,18 @@ mainLoop:
 					x.Abort()
 					return err
 				}
-				x.port.Write([]byte{NAK})
+				if err := x.writeControl(NAK); err != nil {
+					return err
+				}
 			} else if isDuplicate {
 				if afterEOT {
 					// The sender resent the last block in response to our
 					// EOT-NAK: the transfer is already fully received. ACK the
 					// block and complete rather than failing it.
 					log.Info("receive: duplicate after EOT, transfer complete")
-					x.port.Write([]byte{ACK})
+					if err := x.writeControl(ACK); err != nil {
+						return err
+					}
 					log.Printf("receive: transfer complete, %d blocks received", totalReceived)
 					return nil
 				}
@@ -613,7 +637,9 @@ mainLoop:
 					x.Abort()
 					return ErrTransferCanceled
 				}
-				x.port.Write([]byte{ACK})
+				if err := x.writeControl(ACK); err != nil {
+					return err
+				}
 			} else {
 				if _, err := w.Write(data); err != nil {
 					log.Errorf("Error writing received data: %v", err)
@@ -624,7 +650,9 @@ mainLoop:
 				expectedSeq = byte((int(expectedSeq) + 1) % 256)
 				totalReceived++
 				log.Tracef("receive: block %d ACK'd", totalReceived)
-				x.port.Write([]byte{ACK})
+				if err := x.writeControl(ACK); err != nil {
+					return err
+				}
 			}
 		default:
 			log.Errorf("receive: unexpected header byte 0x%02x", header)
@@ -633,7 +661,9 @@ mainLoop:
 				x.Abort()
 				return ErrTransferCanceled
 			}
-			x.port.Write([]byte{NAK})
+			if err := x.writeControl(NAK); err != nil {
+				return err
+			}
 		}
 
 		// Read next header byte, retrying on transient read failures so a
@@ -647,7 +677,9 @@ mainLoop:
 					x.Abort()
 					return err
 				}
-				x.port.Write([]byte{NAK})
+				if err := x.writeControl(NAK); err != nil {
+					return err
+				}
 				continue
 			}
 			bytePacket[0] = controlByte
