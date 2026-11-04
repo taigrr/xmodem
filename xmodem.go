@@ -242,7 +242,10 @@ protocolSniff:
 			}
 			packet := append(header, data...)
 			packet = append(packet, checkSum...)
-			_, err := x.port.Write(packet)
+			written, err := x.port.Write(packet)
+			if err == nil && written != len(packet) {
+				err = io.ErrShortWrite
+			}
 			if err != nil {
 				log.Errorf("Error writing packet: %v", err)
 				errorCount++
