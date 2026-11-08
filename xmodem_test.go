@@ -1402,3 +1402,49 @@ func TestReceiveCRCFallbackOnGarbage(t *testing.T) {
 		t.Errorf("received data mismatch after garbage-triggered fallback")
 	}
 }
+
+func TestSendPacketShortWrite(t *testing.T) {
+	for _, mode := range []Mode{XMode128, XModeCRC, XMode1K} {
+		for _, retries := range []int{0, 1} {
+			port := &nthWriteShortPort{
+				failOn: 1, readBuf: new(bytes.Buffer), writeBuf: new(bytes.Buffer),
+			}
+			handshake := byte(CRC)
+			if mode == XMode128 {
+				handshake = NAK
+			}
+			port.readBuf.Write([]byte{handshake, ACK, ACK})
+			xm := NewWithReadWriter(port)
+			xm.Mode = mode
+			xm.retries = retries
+			err := xm.Send(*bytes.NewBufferString("payload"))
+			if retries == 0 {
+				if !errors.Is(err, ErrTransferCanceled) {
+					t.Errorf("mode %d: short packet write should exhaust retry budget, got %v", mode, err)
+				}
+				if port.readBuf.Len() != 2 {
+					t.Errorf("mode %d: consumed response after incomplete packet", mode)
+				}
+				continue
+			}
+			if err != nil {
+				t.Fatalf("mode %d: retry failed: %v", mode, err)
+			}
+			if port.writes != 3 {
+				t.Errorf("mode %d: got %d writes, want failed packet, retry, EOT", mode, port.writes)
+			}
+			blockSize := 128
+			header := byte(SOH)
+			if mode == XMode1K {
+				blockSize = 1024
+				header = STX
+			}
+			data := bytes.Repeat([]byte{SUB}, blockSize)
+			copy(data, "payload")
+			want := append(buildBlock(header, 1, data, mode != XMode128), EOT)
+			if !bytes.Equal(port.writeBuf.Bytes(), want) {
+				t.Errorf("mode %d: retry did not send complete frame", mode)
+			}
+		}
+	}
+}
