@@ -335,6 +335,10 @@ protocolSniff:
 func (x Xmodem) readByte() (byte, error) {
 	buf := make([]byte, 1)
 	n, err := x.port.Read(buf)
+	// io.Reader may return valid data and an error in the same call.
+	if n > 0 {
+		return buf[0], nil
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -349,13 +353,17 @@ func (x Xmodem) readFull(buf []byte) error {
 	offset := 0
 	for offset < len(buf) {
 		n, err := x.port.Read(buf[offset:])
+		offset += n
+		// A terminal error does not invalidate a completed read.
+		if offset == len(buf) {
+			return nil
+		}
 		if err != nil {
 			return err
 		}
 		if n == 0 {
 			return io.ErrNoProgress
 		}
-		offset += n
 	}
 	return nil
 }
