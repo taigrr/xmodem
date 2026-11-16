@@ -1448,3 +1448,49 @@ func TestSendPacketShortWrite(t *testing.T) {
 		}
 	}
 }
+
+// finalErrorPort returns the last available bytes together with a terminal
+// error, as permitted by io.Reader.
+type finalErrorPort struct {
+	*mockPort
+}
+
+func (port *finalErrorPort) Read(buf []byte) (int, error) {
+	count, err := port.mockPort.Read(buf)
+	if count > 0 && port.readBuf.Len() == 0 {
+		return count, io.EOF
+	}
+	return count, err
+}
+
+func TestSendFinalACKWithEOF(t *testing.T) {
+	port := &finalErrorPort{newMockPort()}
+	port.readBuf.Write([]byte{CRC, ACK, ACK})
+	modem := NewWithReadWriter(port)
+	if err := modem.Send(*bytes.NewBufferString("payload")); err != nil {
+		t.Fatalf("Send discarded final ACK returned with EOF: %v", err)
+	}
+}
+
+func TestReceiveBlockFinalChecksumWithEOF(t *testing.T) {
+	for _, useCRC := range []bool{false, true} {
+		port := &finalErrorPort{newMockPort()}
+		data := bytes.Repeat([]byte{0x42}, 128)
+		frame := buildBlock(SOH, 1, data, useCRC)
+		port.readBuf.Write(frame[1:])
+		modem := NewWithReadWriter(port)
+		got, duplicate, err := modem.receiveBlock(SOH, useCRC, 1)
+		if err != nil || duplicate || !bytes.Equal(got, data) {
+			t.Errorf("CRC=%v: complete block returned with EOF rejected: duplicate=%v err=%v", useCRC, duplicate, err)
+		}
+	}
+}
+
+func TestReadFullTruncatedWithEOF(t *testing.T) {
+	port := &finalErrorPort{newMockPort()}
+	port.readBuf.WriteByte(0x42)
+	modem := NewWithReadWriter(port)
+	if err := modem.readFull(make([]byte, 2)); !errors.Is(err, io.EOF) {
+		t.Fatalf("incomplete read must preserve terminal error, got %v", err)
+	}
+}
